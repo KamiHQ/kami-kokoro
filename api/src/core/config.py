@@ -64,6 +64,14 @@ class Settings(BaseSettings):
     max_temp_dir_age_hours: int = 1  # Remove temp files older than 1 hour
     max_temp_dir_count: int = 3  # Maximum number of temp files to keep
 
+    # Logging Settings
+    log_requests: bool = True  # Whether to log incoming requests
+    log_request_bodies: bool = True  # Whether to log request bodies (debug level)
+    log_user_agents: bool = True  # Whether to log user agents
+    log_gpu_stats: bool = True  # Whether to log GPU utilization stats
+    log_gpu_on_requests: bool = False  # Whether to include GPU stats in request logs
+    gpu_stats_interval: int = 30  # Interval in seconds to log GPU stats (0 = disabled)
+
     class Config:
         env_file = ".env"
 
