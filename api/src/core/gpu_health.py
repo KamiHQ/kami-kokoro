@@ -8,12 +8,22 @@ reports unhealthy no matter which worker serves the probe. The marker is
 cleared as soon as a probe sees the GPU has headroom again, so a transient OOM
 does not keep the pod failing its probes. The file lives in the container
 filesystem, so a restarted container starts clean.
+
+Recording an OOM and the recover-and-clear step both run under an interprocess
+file lock, so a recovery check can never delete an OOM recorded after it
+started.
 """
 
 import os
 import tempfile
 import time
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
 
 import torch
 from loguru import logger
@@ -37,13 +47,32 @@ def is_cuda_oom(error: BaseException) -> bool:
     return "cuda out of memory" in str(error).lower()
 
 
+@contextmanager
+def _marker_lock() -> Iterator[None]:
+    """Exclusive interprocess lock guarding marker publication and clearing."""
+    if fcntl is None:
+        yield
+        return
+    try:
+        lock_path = f"{OOM_MARKER_PATH}.lock"
+        lock_file = open(lock_path, "a")
+    except OSError as e:
+        logger.warning(f"Could not open CUDA OOM lock {lock_path}: {e}")
+        yield
+        return
+    with lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+
+
 def record_cuda_oom() -> None:
     """Mark the container as having hit a CUDA OOM, visible to all workers."""
     tmp_path = f"{OOM_MARKER_PATH}.{os.getpid()}.tmp"
     try:
-        with open(tmp_path, "w") as f:
-            f.write(str(time.time()))
-        os.replace(tmp_path, OOM_MARKER_PATH)
+        with _marker_lock():
+            with open(tmp_path, "w") as f:
+                f.write(str(time.time()))
+            os.replace(tmp_path, OOM_MARKER_PATH)
     except OSError as e:
         logger.warning(f"Could not write CUDA OOM marker {OOM_MARKER_PATH}: {e}")
 
@@ -68,7 +97,7 @@ def clear_cuda_oom() -> None:
         logger.warning(f"Could not clear CUDA OOM marker {OOM_MARKER_PATH}: {e}")
 
 
-def probe_cuda(min_free_bytes: int = 0) -> Optional[str]:
+def probe_cuda(min_free_bytes: int = 0, record_oom: bool = True) -> Optional[str]:
     """Try a small fresh CUDA allocation in this process.
 
     When min_free_bytes is set, also require that much free GPU memory
@@ -86,21 +115,33 @@ def probe_cuda(min_free_bytes: int = 0) -> Optional[str]:
                 return f"only {free / 1024**2:.0f} MiB of GPU memory free"
         return None
     except Exception as e:
-        if is_cuda_oom(e):
+        if record_oom and is_cuda_oom(e):
             record_cuda_oom()
         return str(e)
 
 
-def check_health() -> Optional[str]:
-    """Return a reason the instance is unhealthy, or None when healthy."""
-    age = recent_cuda_oom_age()
-    if age is not None:
-        error = probe_cuda(MIN_FREE_BYTES)
+def _check_recovery() -> Optional[str]:
+    """Clear the OOM marker if the GPU has recovered, else report why not.
+
+    The marker is re-read under the lock, so an OOM recorded by another worker
+    after the caller's first read is honoured and never deleted by mistake.
+    """
+    with _marker_lock():
+        age = recent_cuda_oom_age()
+        if age is None:
+            return None
+        error = probe_cuda(MIN_FREE_BYTES, record_oom=False)
         if error is not None:
             return f"CUDA out of memory recorded {age:.0f}s ago and not recovered: {error}"
         clear_cuda_oom()
-        logger.info(f"GPU recovered from CUDA OOM recorded {age:.0f}s ago")
-        return None
+    logger.info(f"GPU recovered from CUDA OOM recorded {age:.0f}s ago")
+    return None
+
+
+def check_health() -> Optional[str]:
+    """Return a reason the instance is unhealthy, or None when healthy."""
+    if recent_cuda_oom_age() is not None:
+        return _check_recovery()
     error = probe_cuda()
     if error is not None:
         return f"CUDA allocation probe failed: {error}"

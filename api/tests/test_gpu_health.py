@@ -44,10 +44,37 @@ def test_health_503_after_recorded_oom_until_recovered(marker_path):
     assert not os.path.exists(marker_path)
 
 
+def test_recovery_does_not_delete_oom_recorded_during_probe(marker_path):
+    gpu_health.record_cuda_oom()
+    original = open(marker_path).read()
+    time.sleep(0.01)
+
+    def probe_then_other_worker_records(min_free_bytes=0, record_oom=True):
+        # Simulates another worker publishing a newer OOM while we probe. The
+        # lock makes that writer wait, so recovery completes first and the
+        # newer marker survives.
+        import threading
+
+        writer = threading.Thread(target=gpu_health.record_cuda_oom)
+        writer.start()
+        writer.join(timeout=0.2)
+        assert writer.is_alive()
+        probe_then_other_worker_records.writer = writer
+        return None
+
+    with patch.object(gpu_health, "probe_cuda", probe_then_other_worker_records):
+        assert gpu_health.check_health() is None
+
+    probe_then_other_worker_records.writer.join(timeout=5)
+    assert os.path.exists(marker_path)
+    assert open(marker_path).read() != original
+
+
 def test_record_cuda_oom_leaves_no_temp_files(marker_path):
     gpu_health.record_cuda_oom()
     gpu_health.record_cuda_oom()
-    assert os.listdir(os.path.dirname(marker_path)) == ["kokoro_cuda_oom"]
+    leftovers = [f for f in os.listdir(os.path.dirname(marker_path)) if f.endswith(".tmp")]
+    assert leftovers == []
 
 
 def test_oom_marker_expires(marker_path):
