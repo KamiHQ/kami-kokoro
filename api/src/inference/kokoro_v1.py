@@ -10,6 +10,7 @@ from loguru import logger
 
 from ..core import paths
 from ..core.config import settings
+from ..core.gpu_health import is_cuda_oom, record_cuda_oom
 from ..core.model_config import model_config
 from ..structures.schemas import WordTimestamp
 from .base import AudioChunk, BaseModelBackend
@@ -171,6 +172,8 @@ class KokoroV1(BaseModelBackend):
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
+            if self._device == "cuda" and is_cuda_oom(e):
+                record_cuda_oom()
             if (
                 self._device == "cuda"
                 and model_config.pytorch_gpu.retry_on_oom
@@ -319,6 +322,8 @@ class KokoroV1(BaseModelBackend):
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
+            if self._device == "cuda" and is_cuda_oom(e):
+                record_cuda_oom()
             if (
                 self._device == "cuda"
                 and model_config.pytorch_gpu.retry_on_oom
