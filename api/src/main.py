@@ -10,10 +10,12 @@ from pathlib import Path
 import torch
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from .core.config import settings
+from .core.gpu_health import check_health
 from .routers.debug import router as debug_router
 from .routers.development import router as dev_router
 from .routers.openai_compatible import router as openai_router
@@ -138,7 +140,13 @@ if settings.enable_web_player:
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint; 503 when CUDA is out of memory."""
+    reason = check_health()
+    if reason is not None:
+        logger.error(f"Health check failing: {reason}")
+        return JSONResponse(
+            status_code=503, content={"status": "unhealthy", "reason": reason}
+        )
     return {"status": "healthy"}
 
 
