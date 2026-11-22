@@ -1,3 +1,4 @@
+import os
 import time
 from unittest.mock import patch
 
@@ -29,11 +30,24 @@ def test_health_ok_without_oom():
     assert response.json() == {"status": "healthy"}
 
 
-def test_health_503_after_recorded_oom():
+def test_health_503_after_recorded_oom_until_recovered(marker_path):
     gpu_health.record_cuda_oom()
-    response = client.get("/health")
+    with patch.object(gpu_health, "probe_cuda", return_value="only 3 MiB free"):
+        response = client.get("/health")
     assert response.status_code == 503
     assert response.json()["status"] == "unhealthy"
+    assert os.path.exists(marker_path)
+
+    with patch.object(gpu_health, "probe_cuda", return_value=None):
+        response = client.get("/health")
+    assert response.status_code == 200
+    assert not os.path.exists(marker_path)
+
+
+def test_record_cuda_oom_leaves_no_temp_files(marker_path):
+    gpu_health.record_cuda_oom()
+    gpu_health.record_cuda_oom()
+    assert os.listdir(os.path.dirname(marker_path)) == ["kokoro_cuda_oom"]
 
 
 def test_oom_marker_expires(marker_path):

@@ -4,8 +4,10 @@ Each uvicorn worker is a separate process with its own CUDA context, and a
 health probe only reaches one of them. When any worker hits a CUDA
 out-of-memory error it records a timestamp in a file under the temp directory.
 Every worker's /health endpoint reads that file, so the whole container
-reports unhealthy no matter which worker serves the probe. The file lives in
-the container filesystem, so a restarted container starts clean.
+reports unhealthy no matter which worker serves the probe. The marker is
+cleared as soon as a probe sees the GPU has headroom again, so a transient OOM
+does not keep the pod failing its probes. The file lives in the container
+filesystem, so a restarted container starts clean.
 """
 
 import os
@@ -22,9 +24,10 @@ OOM_MARKER_PATH = os.environ.get(
     "CUDA_OOM_MARKER_PATH",
     os.path.join(tempfile.gettempdir(), "kokoro_cuda_oom"),
 )
-# Must outlast the liveness probe's failure window (period * threshold) so a
-# failing instance is restarted rather than flapping back to ready.
-OOM_UNHEALTHY_SECONDS = float(os.environ.get("CUDA_OOM_UNHEALTHY_SECONDS", "120"))
+# Upper bound on how long a marker counts; recovery normally clears it sooner.
+OOM_UNHEALTHY_SECONDS = float(os.environ.get("CUDA_OOM_UNHEALTHY_SECONDS", "300"))
+# Free GPU memory required before an OOM marker is considered recovered.
+MIN_FREE_BYTES = int(float(os.environ.get("CUDA_MIN_FREE_MIB", "256")) * 1024 * 1024)
 
 
 def is_cuda_oom(error: BaseException) -> bool:
@@ -36,9 +39,11 @@ def is_cuda_oom(error: BaseException) -> bool:
 
 def record_cuda_oom() -> None:
     """Mark the container as having hit a CUDA OOM, visible to all workers."""
+    tmp_path = f"{OOM_MARKER_PATH}.{os.getpid()}.tmp"
     try:
-        with open(OOM_MARKER_PATH, "w") as f:
+        with open(tmp_path, "w") as f:
             f.write(str(time.time()))
+        os.replace(tmp_path, OOM_MARKER_PATH)
     except OSError as e:
         logger.warning(f"Could not write CUDA OOM marker {OOM_MARKER_PATH}: {e}")
 
@@ -53,9 +58,21 @@ def recent_cuda_oom_age() -> Optional[float]:
     return age if age < OOM_UNHEALTHY_SECONDS else None
 
 
-def probe_cuda() -> Optional[str]:
+def clear_cuda_oom() -> None:
+    """Forget a recorded OOM once the GPU has recovered."""
+    try:
+        os.remove(OOM_MARKER_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Could not clear CUDA OOM marker {OOM_MARKER_PATH}: {e}")
+
+
+def probe_cuda(min_free_bytes: int = 0) -> Optional[str]:
     """Try a small fresh CUDA allocation in this process.
 
+    When min_free_bytes is set, also require that much free GPU memory
+    (device-wide, so it reflects the other workers too).
     Returns an error message if CUDA is unusable, otherwise None.
     """
     if settings.get_device() != "cuda":
@@ -63,6 +80,10 @@ def probe_cuda() -> Optional[str]:
     try:
         tensor = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
         del tensor
+        if min_free_bytes:
+            free, _ = torch.cuda.mem_get_info()
+            if free < min_free_bytes:
+                return f"only {free / 1024**2:.0f} MiB of GPU memory free"
         return None
     except Exception as e:
         if is_cuda_oom(e):
@@ -74,7 +95,12 @@ def check_health() -> Optional[str]:
     """Return a reason the instance is unhealthy, or None when healthy."""
     age = recent_cuda_oom_age()
     if age is not None:
-        return f"CUDA out of memory recorded {age:.0f}s ago"
+        error = probe_cuda(MIN_FREE_BYTES)
+        if error is not None:
+            return f"CUDA out of memory recorded {age:.0f}s ago and not recovered: {error}"
+        clear_cuda_oom()
+        logger.info(f"GPU recovered from CUDA OOM recorded {age:.0f}s ago")
+        return None
     error = probe_cuda()
     if error is not None:
         return f"CUDA allocation probe failed: {error}"
